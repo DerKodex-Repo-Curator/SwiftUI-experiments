@@ -11,6 +11,7 @@ final class KeyboardPrototypeViewController: UIViewController {
     private final class PrototypeTextView: UITextView {
         var overrideCaretRect: CGRect? {
             didSet {
+                guard overrideCaretRect != oldValue else { return }
                 setNeedsDisplay()
             }
         }
@@ -83,6 +84,13 @@ final class KeyboardPrototypeViewController: UIViewController {
     private var pendingDeleteRange: NSRange?
     private var isScrubCaretPositionLocked = false
 
+    // Scrub updates are driven by a display link so preview work happens at most
+    // once per frame, decoupled from the uneven gesture event delivery rate.
+    private var scrubDisplayLink: CADisplayLink?
+    private var latestScrubTouchLocation = CGPoint.zero
+    private var lastProcessedScrubLocation: CGPoint?
+    private var appliedPreviewRange = NSRange(location: 0, length: 0)
+
     private let keyboardHeight: CGFloat = 276
     private let keyHeight: CGFloat = 45
     private let keyGap: CGFloat = 6
@@ -132,6 +140,10 @@ final class KeyboardPrototypeViewController: UIViewController {
     override func viewDidDisappear(_ animated: Bool) {
         super.viewDidDisappear(animated)
         endScrubDeleting(animated: false)
+    }
+
+    deinit {
+        scrubDisplayLink?.invalidate()
     }
 
     override func viewDidLayoutSubviews() {
@@ -294,6 +306,7 @@ final class KeyboardPrototypeViewController: UIViewController {
 
     private func updateScrubCaretView() {
         guard isScrubbing, !isScrubCaretPositionLocked, let frame = currentCaretFrame() else { return }
+        guard frame != scrubCaretView.frame || scrubCaretView.isHidden else { return }
 
         applyScrubCaretFrame(frame)
     }
@@ -591,7 +604,8 @@ final class KeyboardPrototypeViewController: UIViewController {
         case .began:
             beginScrubDeleting(at: location)
         case .changed:
-            updateScrubDeleting(at: location)
+            // Just record the touch; the display link applies it once per frame.
+            latestScrubTouchLocation = location
         case .ended:
             updateScrubDeleting(at: location, immediate: true)
             endScrubDeleting(commit: true)
@@ -600,6 +614,26 @@ final class KeyboardPrototypeViewController: UIViewController {
         default:
             break
         }
+    }
+
+    private func startScrubDisplayLink() {
+        scrubDisplayLink?.invalidate()
+        let link = CADisplayLink(target: self, selector: #selector(scrubDisplayLinkFired))
+        if #available(iOS 15.0, *) {
+            link.preferredFrameRateRange = CAFrameRateRange(minimum: 80, maximum: 120, preferred: 120)
+        }
+        link.add(to: .main, forMode: .common)
+        scrubDisplayLink = link
+    }
+
+    private func stopScrubDisplayLink() {
+        scrubDisplayLink?.invalidate()
+        scrubDisplayLink = nil
+    }
+
+    @objc private func scrubDisplayLinkFired() {
+        guard isScrubbing else { return }
+        updateScrubDeleting(at: latestScrubTouchLocation)
     }
 
     private func beginScrubDeleting(at location: CGPoint) {
@@ -616,6 +650,8 @@ final class KeyboardPrototypeViewController: UIViewController {
         scrubAxis = .inline
         scrubStartLocation = location
         smoothedScrubLocation = location
+        latestScrubTouchLocation = location
+        lastProcessedScrubLocation = nil
         prepareScrubCaretTransitionFromTypingCaret()
         isScrubCaretPositionLocked = true
         captureScrubPreviewState()
@@ -627,12 +663,20 @@ final class KeyboardPrototypeViewController: UIViewController {
         setKeyboardGlyphsHidden(true, animated: true)
         updateScrubGeometry()
         updateKeyShadowPaths()
+        startScrubDisplayLink()
     }
 
     private func updateScrubDeleting(at location: CGPoint, immediate: Bool = false) {
         guard isScrubbing else { return }
 
         let scrubLocation = scrubPreviewLocation(for: location, immediate: immediate)
+        if !immediate, let lastProcessed = lastProcessedScrubLocation,
+           abs(scrubLocation.x - lastProcessed.x) < 0.1,
+           abs(scrubLocation.y - lastProcessed.y) < 0.1 {
+            return
+        }
+        lastProcessedScrubLocation = scrubLocation
+
         let leftDistance = max(0, deleteCenter.x - scrubLocation.x)
         normalizedScrub = min(1, leftDistance / scrubDistance)
         let nextAxis = axisForScrubLocation(scrubLocation)
@@ -1020,12 +1064,20 @@ final class KeyboardPrototypeViewController: UIViewController {
     ) {
         let selectedRange = textView.selectedRange
         let textLength = textView.textStorage.length
-        let fullRange = NSRange(location: 0, length: textLength)
         let previewRange = clampedTextRange(range, textLength: textLength)
+        let previousRange = clampedTextRange(appliedPreviewRange, textLength: textLength)
 
-        textView.textStorage.beginEditing()
-        if fullRange.length > 0 {
-            textView.textStorage.addAttribute(.foregroundColor, value: textForegroundColor, range: fullRange)
+        // Only touch the ranges whose color actually changes. Restyling the full
+        // text every frame invalidates the whole layout and causes scrub jank.
+        if previewRange != previousRange {
+            textView.textStorage.beginEditing()
+            if previousRange.length > 0 {
+                textView.textStorage.addAttribute(
+                    .foregroundColor,
+                    value: textForegroundColor,
+                    range: previousRange
+                )
+            }
             if previewRange.length > 0 {
                 textView.textStorage.addAttribute(
                     .foregroundColor,
@@ -1033,18 +1085,24 @@ final class KeyboardPrototypeViewController: UIViewController {
                     range: previewRange
                 )
             }
+            textView.textStorage.endEditing()
+            appliedPreviewRange = previewRange
+            textView.typingAttributes = defaultTypingAttributes
         }
-        textView.textStorage.endEditing()
 
-        textView.typingAttributes = defaultTypingAttributes
         if let caretLocation {
-            let caretRange = clampedTextRange(NSRange(location: caretLocation, length: 0))
+            let caretRange = clampedTextRange(NSRange(location: caretLocation, length: 0), textLength: textLength)
             textView.overrideCaretRect = caretOverrideRect
-            textView.selectedRange = caretRange
-            textView.scrollRangeToVisible(caretRange)
+            if textView.selectedRange != caretRange {
+                textView.selectedRange = caretRange
+                textView.scrollRangeToVisible(caretRange)
+            }
         } else {
             textView.overrideCaretRect = nil
-            textView.selectedRange = clampedTextRange(selectedRange)
+            let restoredRange = clampedTextRange(selectedRange, textLength: textLength)
+            if textView.selectedRange != restoredRange {
+                textView.selectedRange = restoredRange
+            }
         }
         updateScrubCaretView()
     }
@@ -1093,6 +1151,7 @@ final class KeyboardPrototypeViewController: UIViewController {
         lineScrubAnchorX = nil
         pendingDeleteRange = nil
         isScrubCaretPositionLocked = false
+        lastProcessedScrubLocation = nil
     }
 
     private func clampedTextRange(_ range: NSRange, textLength: Int? = nil) -> NSRange {
@@ -1115,6 +1174,7 @@ final class KeyboardPrototypeViewController: UIViewController {
     }
 
     private func endScrubDeleting(commit: Bool = false, animated: Bool = true) {
+        stopScrubDisplayLink()
         let hadActiveScrub = isScrubbing
         let shouldCommit = commit && hadActiveScrub && (pendingDeleteRange?.length ?? 0) > 0
 
